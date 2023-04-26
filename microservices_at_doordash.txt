@@ -1,0 +1,125 @@
+Building Reliable Microservices at DoorDash
+DoorDash is the largest food delivery marketplace in the US with over 30 million users in 2022. You can use their mobile app or website to order items from restaurants, convenience stores, supermarkets and more.
+
+In 2020, DoorDash migrated from a Python 2 monolith to a microservices architecture. This allowed them to increase developer velocity (have smaller teams that could deploy independently), use different tech stacks for different classes of services, scale the engineering platform/organization and more.
+
+However, microservices bring a ton of added complexity and introduce new failures that didn’t exist with the monolithic architecture.
+
+DoorDash engineers wrote a great blog post going through the most common microservice failures they’ve experienced and how they dealt with them.
+
+The failures they wrote about were
+
+Cascading Failures
+
+Retry Storms
+
+Death Spirals
+
+Metastable Failures
+
+We’ll describe each of these failures, talk about how they were handled at a local level and then describe how DoorDash is attempting to mitigate them at a global level.
+
+Cascading Failures
+
+Cascading failures describes a general issue where the failure of a single service can lead to a chain reaction of failures in other services.
+
+DoorDash talked about an example of this in May of 2022, where some routine database maintenance temporarily increased read/write latency for the service. This caused higher latency in upstream services which created errors from timeouts. The increase in error rate then triggered a misconfigured circuit breaker which resulted in an outage in the app that lasted for 3 hours.
+
+When you have a distributed system of interconnected services, failures can easily spread across your system and you’ll have to put checks in place to manage them (discussed below).
+
+Retry Storms
+
+One of the ways a failure can spread across your system is through retry storms.
+
+Making calls from one backend service to another is unreliable and can often fail due to completely random reasons. A garbage collection pause can cause increased latencies, network issues can result in timeouts and more.
+
+Therefore, retrying a request can be an effective strategy for temporary failures (distributed systems experience these all the time).
+
+However, retries can also worsen the problem while the downstream service is unavailable/slow. The retries result in work amplification (a failed request will be retried multiple times) and can cause an already degraded service to degrade further.
+
+Death Spiral
+
+With cascading failures, we were mainly talking about issues spreading vertically. If there is a problem with service A, then that impacts the health of service B (if B depends on A). Failures can also spread horizontally, where issues in some nodes of service A will impact (and degrade) the other nodes within service A.
+
+An example of this is a death spiral.
+
+You might have service A that’s running on 3 machines. One of the machines goes down due to a network issue so the incoming requests get routed to the other 2 machines. This causes significantly higher CPU/memory utilization, so one of the remaining two machines crashes due to a resource saturation failure. All the requests are then routed to the last standing machine, resulting in significantly higher latencies.
+
+Metastable Failure
+
+Many of the failures experienced at DoorDash are metastable failures. This is where there is some positive feedback loop within the system that is causing higher than expected load in the system (causing failures) even after the initial trigger is gone.
+
+For example, the initial trigger might be a surge in users. This causes one of the backend services to load shed and respond to certain calls with a 429 (rate limit).
+
+Those callers will retry their calls after a set interval, but the retries (plus calls from new traffic) overwhelm the backend service again and cause even more load shedding. This creates a positive feedback loop where calls are retried (along with new calls), get rate limited, retry again, and so on.
+
+This is called the Thundering Herd problem and is one example of a Metastable failure. The initial spike in users can cause issues in the backend system far after the surge has ended.
+
+Countermeasures
+DoorDash has a couple techniques they use to deal with these issues. These are
+
+Load Shedding - a degraded service will drop requests that are “unimportant” (engineers configure which requests are considered important/unimportant)
+
+Circuit Breaking - if service A is sending service B requests and service A notices a spike in B’s latencies, then circuit breakers will kick in and reduce the number of calls service A makes to service B
+
+Auto Scaling - adding more machines to the server pool for a service when it’s degraded. However, DoorDash avoids doing this reactively (discussed further below).
+
+All these techniques are implemented locally; they do not have a global view of the system. A service will just look at its dependencies when deciding to circuit break, or will solely look at its own CPU utilization when deciding to load shed.
+
+To solve this, DoorDash has been testing out an open source reliability management system called Aperture to act as a centralized load management system that coordinates across all the services in the backend to respond to ongoing outages.
+
+We’ll talk about the techniques DoorDash uses and also about how they use Aperture.
+
+Local Countermeasures
+Load Shedding
+
+With many backend services, you can rank incoming requests by how important they are. A request related to logging might be less important than a request related to a user action.
+
+With Load Shedding, you temporarily reject some of the less important traffic to maximize the goodput (good + throughput) during periods of stress (when CPU/memory utilization is high).
+
+At DoorDash, they instrumented each server with an adaptive concurrency limit from the Netflix library concurrency-limit. This integrates with gRPC and automatically adjusts the maximum number of concurrent requests according to changes in the response latency. When a machine takes longer to respond, the library will reduce the concurrency limit to give each request more compute resources. It can be configured to recognize the priorities of requests from their headers.
+
+Cons of Load Shedding
+
+An issue with load shedding is that it’s very difficult to configure and properly test. Having a misconfigured load shedder will cause unnecessary latency in your system and can be a source of outages.
+
+Services will require different configuration parameters depending on their workload, CPU/memory resources, time of day, etc. Auto-scaling services might mean you need to change the latency/utilization level at which you start to load shed.
+
+Circuit Breaker
+
+While load shedding rejects incoming traffic, circuit breakers will reject outgoing traffic from a service.
+
+They’re implemented as a proxy inside the service and monitor the error rate from downstream services. If the error rate surpasses a configured threshold, then the circuit breaker will start rejecting all outbound requests to the troubled downstream service.
+
+DoorDash built their circuit breakers into their internal gRPC clients.
+
+Cons of Circuit Breaking
+
+The cons are similar to Load Shedding. It’s extremely difficult to determine the error rate threshold at which the circuit breaker should switch on. Many online sources use a 50% error rate as a rule of thumb, but this depends entirely on the downstream service, availability requirements, etc.
+
+Auto-Scaling
+
+When a service is experiencing high resource utilization, an obvious solution is to add more machines to that service’s server pool.
+
+However, DoorDash recommends that teams do not use reactive-auto-scaling. Doing so can temporarily reduce cluster capacity, making the problem worse.
+
+Newly added machines will need time to warm up (fill cache, compile code, etc.) and they’ll run costly startup tasks like opening database connections or triggering membership protocols.
+
+These behaviors can reduce resources for the warmed up nodes that are serving requests. Additionally, these behaviors are infrequent, so having a sudden increase can produce unexpected results.
+
+Instead, DoorDash recommends predictive auto-scaling, where you expand the cluster’s size based on expected traffic levels throughout the day.
+
+Aperture for Reliability Management
+One issue with load shedding, circuit breaking and auto-scaling is that these tools only have a localized view of the system. Factors they can consider include their own resource utilization, direct dependencies and number of incoming requests. However, they can’t take a globalized view of the system and make decisions based on that.
+
+Aperture is an open source reliability management system that can add these capabilities. It offers a centralized load management system that collects reliability-related metrics from different systems and uses it to generate a global view.
+
+It has 3 components
+
+Observe - Aperture collects reliability-related metrics (latency, resource utilization, etc.) from each node using a sidecar and aggregates them in Prometheus. You can also feed in metrics from other sources like InfluxDB, Docker Stats, Kafka, etc.
+
+Analyze - A controller will monitor the metrics in Prometheus and track any deviations from the service-level objectives you set. You set these in a YAML file and Aperture stores them in etcd, a popular distributed key-value store.
+
+Actuate - If any of the policies are triggered, then Aperture will activate configured actions like load shedding or distributed rate limiting across the system.
+
+DoorDash set up Aperture in one of their primary services and sent some artificial requests to load test it. They found that it functioned as a powerful, easy-to-use global rate limiter and load shedder.
